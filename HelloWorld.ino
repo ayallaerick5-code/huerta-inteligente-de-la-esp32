@@ -1,20 +1,13 @@
-
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <DHT.h>
 
-// ==========================================
-// PANTALLA OLED
-// ==========================================
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
   U8G2_R0,
   U8X8_PIN_NONE
 );
 
-// ==========================================
-// PINES
-// ==========================================
 
 #define PIN_DHT 4
 #define TIPO_DHT DHT11
@@ -25,23 +18,27 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
 #define PIN_RELE_1 26
 #define PIN_RELE_2 27
 
-// ==========================================
-// RELES
-// ==========================================
 
 #define RELE_ENCENDIDO LOW
 #define RELE_APAGADO HIGH
 
-// ==========================================
-// UMBRALES
-// ==========================================
-
 const int UMBRAL_HUMEDAD_MIN = 40;
 const int UMBRAL_LUZ_MIN = 30;
 
-// ==========================================
-// CALIBRACION
-// ==========================================
+const float TEMP_HELADA = 0.0;      // <= 0 °C: riesgo de helada
+const float TEMP_FRIO_DANINO = 10.0; // < 10 °C: frio danino
+const float TEMP_CALOR_MAX = 30.0;   // > 30 °C: calor alto
+
+enum EstadoTemperatura {
+  TEMP_SIN_DATO,
+  TEMP_SIN_PROBLEMA,
+  TEMP_FRIO_DANINO_ESTADO,
+  TEMP_HELADA_ESTADO,
+  TEMP_CALOR_ESTADO
+};
+
+EstadoTemperatura estadoTempActual = TEMP_SIN_DATO;
+
 
 const int VALOR_SECO = 3600;
 const int VALOR_MOJADO = 1100;
@@ -60,9 +57,6 @@ float ultimaHumAmb = 0;
 
 bool dhtValido = false;
 
-// ==========================================
-// VARIABLES
-// ==========================================
 
 int ultimaLecturaSueloCruda = 0;
 int ultimoSuelo = 0;
@@ -71,9 +65,6 @@ int ultimaLuz = 0;
 bool ultimoRele1 = false;
 bool ultimoRele2 = false;
 
-// ==========================================
-// TIEMPOS
-// ==========================================
 
 unsigned long tiempoLecturaAnterior = 0;
 const unsigned long intervaloLectura = 2000;
@@ -83,53 +74,45 @@ const unsigned long intervaloOLED = 500;
 
 unsigned long tiempoPantallaAnterior = 0;
 
-// ==========================================
-// CONTROL DE BOMBA
-// ==========================================
 
 unsigned long tiempoCicloBombaAnterior = 0;
 unsigned long tiempoInicioEncendidoBomba = 0;
 
-// Cada 50 segundos
-const unsigned long intervaloBomba = 50000;
+// Cada 3 minutos = 180,000 ms
+const unsigned long intervaloBomba = 180000UL;
 
-// Encendida durante 15 segundos
-const unsigned long duracionEncendidoBomba = 15000;
+// Encendida durante 15 segundos = 15,000 ms
+const unsigned long duracionEncendidoBomba = 15000UL;
 
 bool bombaCicloActiva = false;
 
-// ==========================================
-// PANTALLAS
-// ==========================================
 
-const int NUM_PANTALLAS = 4;
+const int NUM_PANTALLAS = 5;
 
 int pantallaActual = 0;
 
 const unsigned long duracionPantalla[NUM_PANTALLAS] = {
-  10000,
-  2000,
-  3000,
-  3000
+  8000, // 0: Monitor ambiental
+  5000, // 1: Alerta temperatura / helada o sin problema
+  2500, // 2: Autores
+  2500, // 3: Proyecto integrador
+  2500  // 4: Huerta inteligente
 };
 
-// ==========================================
-// FUNCIONES
-// ==========================================
 
 int leerHumedadSuelo();
+void evaluarEstadoTemperatura();
+const char* etiquetaCortaTemperatura();
 
 void actualizarBombaAgua(unsigned long ahora);
 void actualizarRele1();
 
 void actualizarOLED();
+void mostrarAlertaTemperatura();
 void mostrarCreditos();
 void mostrarProyecto();
 void mostrarHuertaInteligente();
 
-// ==========================================
-// SETUP
-// ==========================================
 
 void setup() {
 
@@ -150,6 +133,8 @@ void setup() {
 
   u8g2.setBusClock(100000);
   u8g2.begin();
+  // Si se ve al reves o volteada, cambia entre 0 y 1:
+  u8g2.setFlipMode(1);
 
   unsigned long inicio = millis();
 
@@ -160,29 +145,19 @@ void setup() {
 
   Serial.println("SISTEMA INICIADO");
   Serial.println("RIEGO: 15 SEGUNDOS");
-  Serial.println("INTERVALO: 50 SEGUNDOS");
+  Serial.println("INTERVALO: 3 MINUTOS (180 SEGUNDOS)");
 }
 
-// ==========================================
-// LOOP
-// ==========================================
 
 void loop() {
 
   unsigned long ahora = millis();
 
-  // CONTROL DE BOMBA
   actualizarBombaAgua(ahora);
-
-  // ========================================
-  // LECTURA DE SENSORES
-  // ========================================
 
   if (ahora - tiempoLecturaAnterior >= intervaloLectura) {
 
     tiempoLecturaAnterior = ahora;
-
-    // DHT11
 
     float temp = dht.readTemperature();
     float humAmb = dht.readHumidity();
@@ -191,7 +166,6 @@ void loop() {
 
       ultimaTemp = temp;
       ultimaHumAmb = humAmb;
-
       dhtValido = true;
 
       Serial.println("DHT11: LECTURA CORRECTA");
@@ -199,14 +173,12 @@ void loop() {
     } else {
 
       dhtValido = false;
-
       Serial.println("ERROR: EL DHT11 NO RESPONDE");
     }
 
-    // HUMEDAD DEL SUELO
+    evaluarEstadoTemperatura();
 
     int lecturaSuelo = leerHumedadSuelo();
-
     ultimaLecturaSueloCruda = lecturaSuelo;
 
     ultimoSuelo = constrain(
@@ -220,8 +192,6 @@ void loop() {
       0,
       100
     );
-
-    // SENSOR DE LUZ
 
     int lecturaLuz = analogRead(PIN_SENSOR_LUZ);
 
@@ -237,8 +207,6 @@ void loop() {
       100
     );
 
-    // CONTROL DE RELES
-
     actualizarRele1();
 
     ultimoRele2 = (ultimaLuz < UMBRAL_LUZ_MIN);
@@ -248,24 +216,35 @@ void loop() {
       ultimoRele2 ? RELE_ENCENDIDO : RELE_APAGADO
     );
 
-    // MONITOR SERIAL
-
     Serial.println("----------------------");
 
     if (dhtValido) {
 
       Serial.print("Temperatura: ");
-      Serial.print(ultimaTemp);
+      Serial.print(ultimaTemp, 1);
       Serial.println(" C");
 
       Serial.print("Humedad ambiente: ");
-      Serial.print(ultimaHumAmb);
+      Serial.print(ultimaHumAmb, 1);
       Serial.println("%");
 
     } else {
 
       Serial.println("Temperatura: ERROR DHT11");
       Serial.println("Humedad ambiente: ERROR DHT11");
+    }
+
+    Serial.print("Estado temperatura: ");
+    Serial.println(etiquetaCortaTemperatura());
+
+    if (estadoTempActual == TEMP_HELADA_ESTADO) {
+      Serial.println("ALERTA: RIESGO DE HELADA -> GUARDA LA PLANTA AHORA");
+    } else if (estadoTempActual == TEMP_FRIO_DANINO_ESTADO) {
+      Serial.println("AVISO: FRIO DANINO (<10 C) -> GUARDA LA PLANTA");
+    } else if (estadoTempActual == TEMP_CALOR_ESTADO) {
+      Serial.println("AVISO: TEMPERATURA ALTA (>30 C)");
+    } else if (estadoTempActual == TEMP_SIN_PROBLEMA) {
+      Serial.println("TEMPERATURA: SIN PROBLEMA");
     }
 
     Serial.print("ADC Suelo: ");
@@ -284,11 +263,19 @@ void loop() {
 
     Serial.print("Rele 2: ");
     Serial.println(ultimoRele2 ? "ENCENDIDO" : "APAGADO");
-  }
 
-  // ========================================
-  // CAMBIO DE PANTALLAS
-  // ========================================
+    Serial.printf("CSV,%lu,%.1f,%.1f,%d,%d,%d,%d,%d,%d\n",
+      ahora,
+      dhtValido ? ultimaTemp : -99.0,
+      dhtValido ? ultimaHumAmb : -1.0,
+      ultimaLecturaSueloCruda,
+      ultimoSuelo,
+      ultimaLuz,
+      ultimoRele1 ? 1 : 0,
+      ultimoRele2 ? 1 : 0,
+      (int)estadoTempActual
+    );
+  }
 
   if (
     ahora - tiempoPantallaAnterior >=
@@ -304,9 +291,6 @@ void loop() {
     }
   }
 
-  // ========================================
-  // ACTUALIZAR OLED
-  // ========================================
 
   if (ahora - tiempoOLEDAnterior >= intervaloOLED) {
 
@@ -318,9 +302,13 @@ void loop() {
 
     } else if (pantallaActual == 1) {
 
-      mostrarCreditos();
+      mostrarAlertaTemperatura();
 
     } else if (pantallaActual == 2) {
+
+      mostrarCreditos();
+
+    } else if (pantallaActual == 3) {
 
       mostrarProyecto();
 
@@ -331,9 +319,40 @@ void loop() {
   }
 }
 
-// ==========================================
-// ACTUALIZAR RELE 1
-// ==========================================
+void evaluarEstadoTemperatura() {
+
+  if (!dhtValido) {
+    estadoTempActual = TEMP_SIN_DATO;
+    return;
+  }
+
+  if (ultimaTemp <= TEMP_HELADA) {
+    estadoTempActual = TEMP_HELADA_ESTADO;
+  } else if (ultimaTemp < TEMP_FRIO_DANINO) {
+    estadoTempActual = TEMP_FRIO_DANINO_ESTADO;
+  } else if (ultimaTemp > TEMP_CALOR_MAX) {
+    estadoTempActual = TEMP_CALOR_ESTADO;
+  } else {
+    estadoTempActual = TEMP_SIN_PROBLEMA;
+  }
+}
+
+const char* etiquetaCortaTemperatura() {
+
+  switch (estadoTempActual) {
+    case TEMP_HELADA_ESTADO:
+      return "HELADA!";
+    case TEMP_FRIO_DANINO_ESTADO:
+      return "FRIO!";
+    case TEMP_CALOR_ESTADO:
+      return "CALOR!";
+    case TEMP_SIN_PROBLEMA:
+      return "OK";
+    default:
+      return "ERR";
+  }
+}
+
 
 void actualizarRele1() {
 
@@ -354,59 +373,53 @@ void actualizarRele1() {
   }
 }
 
-// ==========================================
-// CONTROL DE BOMBA
-// ==========================================
 
 void actualizarBombaAgua(unsigned long ahora) {
 
   // INICIO DEL CICLO
-
   if (
     !bombaCicloActiva &&
     ahora - tiempoCicloBombaAnterior >= intervaloBomba
   ) {
 
     tiempoCicloBombaAnterior = ahora;
-
     tiempoInicioEncendidoBomba = ahora;
-
     bombaCicloActiva = true;
 
     Serial.println("BOMBA: INICIO DE RIEGO");
   }
 
   // FINALIZAR DESPUES DE 15 SEGUNDOS
-
   if (
     bombaCicloActiva &&
     ahora - tiempoInicioEncendidoBomba >= duracionEncendidoBomba
   ) {
 
     bombaCicloActiva = false;
-
     Serial.println("BOMBA: FIN DE RIEGO");
   }
 
   actualizarRele1();
 }
 
-// ==========================================
-// LECTURA PROMEDIO SENSOR DE SUELO
-// ==========================================
 
 int leerHumedadSuelo() {
 
+  const int muestras = 10;
   long suma = 0;
+  int tomadas = 0;
+  unsigned long ultimaMuestra = micros();
 
-  for (int i = 0; i < 10; i++) {
-
-    suma += analogRead(PIN_HUMEDAD_SUELO);
-
-    delay(5);
+  while (tomadas < muestras) {
+    if (micros() - ultimaMuestra >= 5000) {
+      ultimaMuestra = micros();
+      suma += analogRead(PIN_HUMEDAD_SUELO);
+      tomadas++;
+    }
+    yield();
   }
 
-  int promedio = suma / 10;
+  int promedio = suma / muestras;
 
   Serial.print("LECTURA REAL DEL SUELO: ");
   Serial.println(promedio);
@@ -414,134 +427,130 @@ int leerHumedadSuelo() {
   return promedio;
 }
 
-// ==========================================
-// PANTALLA PRINCIPAL
-// ==========================================
 
 void actualizarOLED() {
 
-  char texto[30];
+  char texto[28];
 
   u8g2.clearBuffer();
-
   u8g2.setFont(u8g2_font_5x7_tf);
 
-  u8g2.drawStr(5, 8, "MONITOR AMBIENTAL");
-
-  u8g2.drawHLine(0, 11, 128);
-
-  if (dhtValido) {
-
-    snprintf(
-      texto,
-      sizeof(texto),
-      "Temperatura: %.1f C",
-      ultimaTemp
-    );
-
-  } else {
-
-    snprintf(texto, sizeof(texto), "Temperatura: ERROR");
-  }
-
-  u8g2.drawStr(2, 21, texto);
+  u8g2.drawStr(2, 8, "MONITOR AMBIENTAL");
+  u8g2.drawHLine(0, 10, 128);
 
   if (dhtValido) {
-
-    snprintf(
-      texto,
-      sizeof(texto),
-      "Hum. ambiente: %.1f%%",
-      ultimaHumAmb
-    );
-
+    snprintf(texto, sizeof(texto), "T:%.1fC [%s]", ultimaTemp, etiquetaCortaTemperatura());
   } else {
-
-    snprintf(texto, sizeof(texto), "Hum. ambiente: ERROR");
+    snprintf(texto, sizeof(texto), "T:ERR [ERR]");
   }
+  u8g2.drawStr(2, 19, texto);
 
-  u8g2.drawStr(2, 31, texto);
+  if (dhtValido) {
+    snprintf(texto, sizeof(texto), "H.amb:%.1f%%", ultimaHumAmb);
+  } else {
+    snprintf(texto, sizeof(texto), "H.amb:ERR");
+  }
+  u8g2.drawStr(2, 28, texto);
 
-  snprintf(
-    texto,
-    sizeof(texto),
-    "Hum. suelo: %d%%",
-    ultimoSuelo
-  );
+  snprintf(texto, sizeof(texto), "H.suelo:%d%%", ultimoSuelo);
+  u8g2.drawStr(2, 37, texto);
 
-  u8g2.drawStr(2, 41, texto);
-
-  snprintf(
-    texto,
-    sizeof(texto),
-    "Luz: %d%%",
-    ultimaLuz
-  );
-
-  u8g2.drawStr(2, 51, texto);
-
-  snprintf(
-    texto,
-    sizeof(texto),
-    "R1:%s  R2:%s",
+  snprintf(texto, sizeof(texto), "Luz:%d%% R1:%s R2:%s",
+    ultimaLuz,
     ultimoRele1 ? "ON" : "OFF",
     ultimoRele2 ? "ON" : "OFF"
   );
+  u8g2.drawStr(2, 46, texto);
 
-  u8g2.drawStr(2, 61, texto);
+  if (estadoTempActual == TEMP_HELADA_ESTADO || estadoTempActual == TEMP_FRIO_DANINO_ESTADO) {
+    u8g2.drawStr(2, 56, "GUARDA LA PLANTA");
+  } else if (estadoTempActual == TEMP_SIN_PROBLEMA) {
+    u8g2.drawStr(2, 56, "Sin problema");
+  } else {
+    u8g2.drawStr(2, 56, "Revisar sensor");
+  }
 
   u8g2.sendBuffer();
 }
 
-// ==========================================
-// PANTALLA DE AUTORES
-// ==========================================
+void mostrarAlertaTemperatura() {
+
+  char lineaTemp[24];
+
+  u8g2.clearBuffer();
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(4, 11, "ESTADO TERMICO");
+  u8g2.drawHLine(0, 14, 128);
+
+  if (!dhtValido) {
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(2, 28, "Sin lectura DHT11");
+    u8g2.drawStr(2, 40, "Revisa conexion/sensor");
+    u8g2.drawStr(2, 52, "para alerta de helada");
+  } else {
+    snprintf(lineaTemp, sizeof(lineaTemp), "Temp: %.1f C", ultimaTemp);
+    u8g2.drawStr(4, 26, lineaTemp);
+
+    u8g2.setFont(u8g2_font_5x7_tf);
+
+    if (estadoTempActual == TEMP_HELADA_ESTADO) {
+      u8g2.drawStr(2, 39, "RIESGO DE HELADA");
+      u8g2.drawStr(2, 50, "GUARDA LA PLANTA YA!");
+      u8g2.drawStr(2, 61, "Temp <= 0 C");
+    } else if (estadoTempActual == TEMP_FRIO_DANINO_ESTADO) {
+      u8g2.drawStr(2, 39, "FRIO DANINO (<10 C)");
+      u8g2.drawStr(2, 50, "GUARDA LA PLANTA");
+      u8g2.drawStr(2, 61, "Sitio cubierto");
+    } else if (estadoTempActual == TEMP_CALOR_ESTADO) {
+      u8g2.drawStr(2, 39, "CALOR ALTO (>30 C)");
+      u8g2.drawStr(2, 50, "Evita sol fuerte");
+      u8g2.drawStr(2, 61, "Revisa ventilacion");
+    } else {
+      u8g2.drawStr(2, 40, "NO HAY PROBLEMA");
+      u8g2.drawStr(2, 52, "Temperatura normal");
+      u8g2.drawStr(2, 62, "para la planta");
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
 
 void mostrarCreditos() {
 
   u8g2.clearBuffer();
 
-  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(28, 14, "AUTORES");
+  u8g2.drawHLine(0, 18, 128);
 
-  u8g2.drawStr(35, 18, "AUTORES");
-
-  u8g2.drawStr(15, 37, "Erik Quiroga");
-
-  u8g2.drawStr(15, 52, "David Quiroga");
+  u8g2.drawStr(6, 35, "Erik Quiroga");
+  u8g2.drawStr(6, 52, "David Quiroga");
 
   u8g2.sendBuffer();
 }
 
-// ==========================================
-// PANTALLA DEL PROYECTO
-// ==========================================
 
 void mostrarProyecto() {
 
   u8g2.clearBuffer();
 
-  u8g2.setFont(u8g2_font_6x12_tf);
-
-  u8g2.drawStr(25, 25, "PROYECTO");
-
-  u8g2.drawStr(10, 43, "INTEGRADOR :)");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(24, 24, "PROYECTO");
+  u8g2.drawStr(14, 44, "INTEGRADOR :)");
 
   u8g2.sendBuffer();
 }
 
-// ==========================================
-// PANTALLA FINAL
-// ==========================================
 
 void mostrarHuertaInteligente() {
 
   u8g2.clearBuffer();
 
-  u8g2.setFont(u8g2_font_6x12_tf);
-
-  u8g2.drawStr(12, 25, "HUERTA");
-
-  u8g2.drawStr(12, 43, "INTELIGENTE :)");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(26, 24, "HUERTA");
+  u8g2.drawStr(10, 44, "INTELIGENTE :)");
 
   u8g2.sendBuffer();
 }
